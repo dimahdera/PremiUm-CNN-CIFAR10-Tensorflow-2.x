@@ -1,0 +1,2 @@
+model_checkpoint_path: "vdp_cnn_model"
+all_model_checkpoint_paths: "vdp_cnn_model"
