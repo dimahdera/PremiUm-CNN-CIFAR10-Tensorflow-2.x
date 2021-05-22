@@ -13,7 +13,7 @@ import wandb
 import xlsxwriter
 import pandas as pd
 from scipy.interpolate import make_interp_spline, BSpline
-#os.environ["WANDB_API_KEY"] = " "
+#os.environ["WANDB_API_KEY"] = ""
 plt.ioff()
 cifar10 = tf.keras.datasets.cifar10
 # update_progress() : Displays or updates a console progress bar
@@ -323,6 +323,40 @@ class VDPELU(keras.layers.Layer):
         gradi = g.gradient(out, mu_in)
         Sigma_out = activation_function_Sigma(gradi, Sigma_in)
         return mu_out, Sigma_out
+        
+        
+class UT_VDPELU(keras.layers.Layer):
+    def __init__(self):
+        super(UT_VDPELU, self).__init__()
+    def call(self, mu_in, Sigma_in):
+        batch_size = mu_in.shape[0]
+        n_g =  mu_in.shape[1]*mu_in.shape[1]
+        Sigma_in1 = tf.transpose(Sigma_in, [0,3, 1,2])
+        Sigma_in_diag = tf.linalg.diag_part(Sigma_in1 )#shape=[batch_size, num_filter[0], image_size*image_size]
+        
+        non_zero = tf.not_equal(Sigma_in_diag, 0.)
+        l_gg_mask = tf.boolean_mask(Sigma_in_diag, non_zero)
+        out_sqrt = tf.math.sqrt(l_gg_mask) #tf.reciprocal(tf.sqrt(l_gg_mask))
+        idx_l_gg = tf.cast(tf.where(non_zero), tf.int32)   
+        L_gg = tf.scatter_nd(idx_l_gg, out_sqrt, tf.shape(non_zero))   
+        L_g = tf.linalg.diag(L_gg)
+        L = np.sqrt(n_g)* L_g 
+        x_hat1 = tf.transpose(tf.reshape(mu_in, [batch_size, n_g, -1]), [0,2,1])#shape=[batch_size, num_filter[0], image_size*image_size]
+        x_hat = tf.ones([1,1,1, n_g]) * tf.expand_dims(x_hat1, axis=-1) #shape=[batch_size, num_filter[0], image_size*image_size, image_size*image_size]
+        sigma_points1 = x_hat  + L 
+        sigma_points2 = x_hat  - L
+        mu_g1 = (1/(2*n_g))*(tf.math.reduce_sum(tf.nn.elu(sigma_points1) + tf.nn.elu(sigma_points2), -1))#shape=[batch_size, num_filter[0], image_size*image_size]
+        mu_out = tf.reshape(tf.transpose(mu_g1, [0, 2,1]), [batch_size, mu_in.shape[1], mu_in.shape[1],-1 ]) #shape=[ image_size, image_size,num_filters[0] ]
+        
+        mu_g2 = tf.ones([1, 1,1, n_g]) * tf.expand_dims(mu_g1, axis=-1)#shape=[batch_size, num_filter[0], image_size*image_size, image_size*image_size]
+        P_ga1 = tf.nn.elu(sigma_points1) - mu_g2
+        P_gb1 = tf.matmul(P_ga1, tf.transpose(P_ga1, [0,1, 3, 2]))
+        P_ga2 = tf.nn.elu(sigma_points2) - mu_g2 
+        P_gb2 = tf.matmul(P_ga2, tf.transpose(P_ga2, [0,1, 3, 2])) 
+        P_gg = (1/(2*n_g))*(P_gb1 + P_gb2)#shape=[batch_size, num_filter[0], image_size*image_size, image_size*image_size]        
+        Sigma_out = tf.transpose(P_gg, [0, 2,3,1])
+        return mu_out, Sigma_out
+
 
 class VDPDropout(keras.layers.Layer):
     def __init__(self, drop_prop):
@@ -389,7 +423,7 @@ class Density_prop_CNN(tf.keras.Model):
         self.conv_9 = VDP_intermediate_Conv(kernel_size=self.kernel_size[8], kernel_num=self.num_kernel[8],   padding='SAME')
         self.conv_10 = VDP_intermediate_Conv(kernel_size=self.kernel_size[9], kernel_num=self.num_kernel[9],   padding='SAME')
 
-        self.elu_1 = VDPELU()
+        self.elu_1 = UT_VDPELU()
         self.maxpooling_1 = VDP_MaxPooling(pooling_size=self.pooling_size[0], pooling_stride=self.pooling_stride[0],   pooling_pad=self.pooling_pad)
         self.maxpooling_2 = VDP_MaxPooling(pooling_size=self.pooling_size[1], pooling_stride=self.pooling_stride[1],   pooling_pad=self.pooling_pad)
         self.maxpooling_3 = VDP_MaxPooling(pooling_size=self.pooling_size[2], pooling_stride=self.pooling_stride[2],   pooling_pad=self.pooling_pad)
@@ -447,18 +481,18 @@ class Density_prop_CNN(tf.keras.Model):
         mu, sigma = self.elu_1(mu, sigma)
         mu, sigma = self.batch_norm(mu, sigma)        
               
-        mu, sigma = self.fc_1(mu, sigma)
+        mu, sigma = self.fc_1(mu, sigma) 
         mu_out, Sigma_out = self.mysoftma(mu, sigma)
         Sigma_out = tf.where(tf.math.is_nan(Sigma_out), tf.zeros_like(Sigma_out), Sigma_out)
         Sigma_out = tf.where(tf.math.is_inf(Sigma_out), tf.zeros_like(Sigma_out), Sigma_out)
         return mu_out, Sigma_out
 
 
-def nll_gaussian(y_test, y_pred_mean, y_pred_sd, num_labels, batch_size):     
+def nll_gaussian(y_test, y_pred_mean, y_pred_sd, num_labels, batch_size):    
     y_pred_sd_ns = y_pred_sd 
     s, u, v = tf.linalg.svd(y_pred_sd_ns, full_matrices=True, compute_uv=True)	
     s_ = s + 1.0e-3
-    s_inv = tf.linalg.diag(tf.math.divide_no_nan(1., s_) )    
+    s_inv = tf.linalg.diag(tf.math.divide_no_nan(1., s_) )     
     y_pred_sd_inv = tf.matmul(tf.matmul(v, s_inv), tf.transpose(u, [0, 2,1])) 
     mu_ = y_test - y_pred_mean 
     mu_sigma = tf.matmul( tf.expand_dims(mu_, axis=1)  ,  y_pred_sd_inv)     
@@ -472,15 +506,15 @@ def nll_gaussian(y_test, y_pred_mean, y_pred_sd, num_labels, batch_size):
 def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64, 64, 128, 128, 128],
                   kernels_size=[5, 3, 3, 3, 3, 3, 3, 3, 3, 1], maxpooling_size=[2, 2, 2, 2, 2],
                   maxpooling_stride=[2, 2, 2, 2, 2], maxpooling_pad='SAME', class_num=10,
-                  batch_size=50, epochs=350, lr=0.0002, lr_end = 0.0001, kl_factor=0.00001, 
-                  Random_noise=False, Adversarial_noise=False, HCV=0.01,   Black_box_attack=False, PGDBlack_box_attack=True, 
+                  batch_size=50, epochs=10, lr=0.0002, lr_end = 0.0001, kl_factor=0.00001,
+                  Random_noise=False, Adversarial_noise=False, HCV=0.1,  Black_box_attack=False,     PGDBlack_box_attack=True,       
                   adversary_target_cls=3, Targeted=True, PGD_Adversarial_noise=False, stepSize=1, maxAdvStep=40,
-                  Training=False, Testing = False, continue_training=False, saved_model_epochs=300):
-    PATH = './latest_run/saved_models/VDP_cnn_epoch_{}/'.format(epochs)
+                  Training=False, Testing=False, continue_training=False, saved_model_epochs=350):
+    PATH = './UT_VDP/saved_models/UTVDP_cnn_epoch_{}/'.format(epochs) 
     (x_train, y_train), (x_test, y_test) = cifar10.load_data() 
-    x_train, x_test = x_train / 255.0, x_test / 255.0 
-    x_train = x_train.astype('float32')
-    x_test = x_test.astype('float32')
+    x_train, x_test = x_train/255.0, x_test/255.0  
+    x_train = x_train.astype('float32')  
+    x_test = x_test.astype('float32') 
     one_hot_y_train = tf.one_hot(np.squeeze(y_train).astype(np.float32), depth=class_num)
     one_hot_y_test = tf.one_hot(np.squeeze(y_test).astype(np.float32), depth=class_num)
     tr_dataset = tf.data.Dataset.from_tensor_slices((x_train, one_hot_y_train)).batch(batch_size)
@@ -541,7 +575,7 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
           signed_grad = tf.sign(gradient)
           return signed_grad  
     if Training: 
-       # wandb.init(entity = "dimah", project="VDP_CNN_Cifar10_11layers_epochs_{}_lr_{}_github".format(epochs, lr)) 
+       # wandb.init(entity = "dimah", project="UT_VDP_CNN_Cifar10_11layers_epochs_{}_lr_{}_github".format(epochs, lr)) 
         if continue_training:
             saved_model_path = './latest_run/saved_models/VDP_cnn_epoch_{}/'.format(saved_model_epochs)
             cnn_model.load_weights(saved_model_path + 'vdp_cnn_model')
@@ -564,11 +598,11 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
                 corr = tf.equal(tf.math.argmax(mu_out, axis=-1), tf.math.argmax(y, axis=-1))
                 accuracy = tf.reduce_mean(tf.cast(corr, tf.float32))                
                 acc_training[tr_no_steps] = accuracy.numpy()
-                if step % 1000 == 0:
+                if step % 100 == 0:
                     print('\n gradient', np.mean(gradients[0].numpy()))
-                    print('\n Matrix Norm', np.mean(sigma))   
-                    print("\n Step:", step, "Loss:", np.mean(np.amin(err_training)) )                    
-                    print("Training accuracy so far: %.4f" % float(np.mean(np.amax(acc_training)) ))                                      
+                    print('\n Matrix Norm', np.mean(sigma))    
+                    print("\n Step:", step, "Loss:", err_training[tr_no_steps] )                    
+                    print("Training accuracy so far: %.4f" % float(acc_training[tr_no_steps] ))                                      
                 tr_no_steps += 1                 
             
             train_acc[epoch] = np.mean(acc_training)
@@ -585,9 +619,9 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
                 corr = tf.equal(tf.math.argmax(mu_out, axis=-1), tf.math.argmax(y, axis=-1))
                 va_accuracy = tf.reduce_mean(tf.cast(corr, tf.float32))                
                 acc_validation[va_no_steps] = va_accuracy.numpy()
-                if step % 1000 == 0:
-                    print("Step:", step, "Loss:", float(np.mean(np.amin(err_validation))))
-                    print("validation accuracy so far: %.4f" % np.mean(np.amax(acc_validation)) )
+                if step % 50 == 0:
+                    print("Step:", step, "Loss:", float(err_validation[va_no_steps]))
+                    print("validation accuracy so far: %.4f" % acc_validation[va_no_steps] )
                 va_no_steps += 1                
             
             valid_acc[epoch] = np.mean(acc_validation)
@@ -623,7 +657,7 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
             plt.xlabel("Epochs")
             plt.ylabel("Accuracy")
             plt.legend(loc='lower right')
-            plt.savefig(PATH + 'VDP_CNN_on_CIFAR10_Data_acc.png')
+            plt.savefig(PATH + 'UTVDP_CNN_on_CIFAR10_Data_acc.png')
             plt.close(fig) 
             
             
@@ -638,7 +672,7 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
             plt.xlabel("Epochs")
             plt.ylabel("Loss")
             plt.legend(loc='upper right')
-            plt.savefig(PATH + 'VDP_CNN_on_CIFAR10_Data_error.png')
+            plt.savefig(PATH + 'UTVDP_CNN_on_CIFAR10_Data_error.png')
             plt.close(fig)
                 
         f1 = open(PATH + 'training_validation_acc_error.pkl', 'wb')
@@ -674,11 +708,11 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
         textfile.write("\n---------------------------------")
         textfile.close()
     # -------------------------Testing-----------------------------
-    elif (Testing):
+    if (Testing):
         test_path = 'test_results/'
         if Random_noise:
             test_path = 'test_results_random_noise_{}/'.format(HCV)  
-            gaussain_noise_std = HCV/3    
+            gaussain_noise_std = HCV/3             
         
         cnn_model.load_weights(PATH + 'vdp_cnn_model')
         test_no_steps = 0
@@ -703,7 +737,7 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
             accuracy = tf.reduce_mean(tf.cast(corr, tf.float32))
             acc_test[test_no_steps] = accuracy.numpy()
             if step % 50 == 0:
-                print("Total running accuracy so far: %.4f" % acc_test[test_no_steps])
+                print("Total running accuracy so far: %.4f" % acc_test[test_no_steps] )
             test_no_steps += 1
             
         test_acc = np.mean(acc_test)        
@@ -847,7 +881,9 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
             textfile.write("\n SNR: "+ str(np.mean(snr_signal))) 
         textfile.write("\n---------------------------------")
         textfile.close()
-    
+
+
+        
     if (Black_box_attack):
         if Targeted:
             test_path = 'test_results_targeted_Black_box_attack_{}/'.format(HCV)
@@ -863,7 +899,8 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
         pf.close()
         
         test_samples = adv_perturbations.shape[0]
-        test_no_steps = 0
+        test_no_steps = 0        
+
         mu_out_ = np.zeros([int(test_samples), batch_size, class_num])
         sigma_ = np.zeros([int(test_samples), batch_size, class_num, class_num])
         acc_test = np.zeros(int(test_samples))
@@ -894,14 +931,21 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
         pf.close()
         
         
-        var = np.zeros([int(test_samples) ,batch_size])      
+        var = np.zeros([int(test_samples) ,batch_size])
         for i in range(int(test_samples)):
             for j in range(batch_size):               
                 predicted_out = np.argmax(mu_out_[i,j,:])
-                var[i,j] = sigma_[i,j, int(predicted_out), int(predicted_out)]               
+                var[i,j] = sigma_[i,j, int(predicted_out), int(predicted_out)]              
          
-        print('Output Variance', np.mean(var))
+        print('Output Variance', np.mean(var))     
         
+##        var1 = np.reshape(var, int(test_samples)* batch_size)                 
+##        writer = pd.ExcelWriter(PATH + test_path + 'variance.xlsx', engine='xlsxwriter')
+##        df = pd.DataFrame(np.abs(var1) )   
+##        # Write your DataFrame to a file   
+##        df.to_excel(writer, "Sheet")            
+##        writer.save()
+
         textfile = open(PATH + test_path + 'Related_hyperparameters.txt', 'w')
         textfile.write(' Input Dimension : ' + str(input_dim))
         textfile.write('\n No of Kernels : ' + str(num_kernels))
@@ -925,11 +969,11 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
             else:
                 textfile.write('\n Adversarial attack: Non-TARGETED')
             textfile.write('\n Adversarial Noise epsilon: ' + str(epsilon))
-            textfile.write('\n Adversarial Noise HCV: ' + str(HCV))         
+            textfile.write('\n Adversarial Noise HCV: ' + str(HCV))
+         #   textfile.write("\n SNR: "+ str(np.mean(snr_signal))) 
         textfile.write("\n---------------------------------")
         textfile.close()
-        
-        
+
         
     if (PGDBlack_box_attack):
         if Targeted:
@@ -945,7 +989,8 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
         pf.close()
         
         test_samples = adv_perturbations.shape[0]
-        test_no_steps = 0
+        test_no_steps = 0        
+
         mu_out_ = np.zeros([int(test_samples), batch_size, class_num])
         sigma_ = np.zeros([int(test_samples), batch_size, class_num, class_num])
         acc_test = np.zeros(int(test_samples))
@@ -954,6 +999,7 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
         for step, (x, y) in enumerate(val_dataset):
             if(test_no_steps < test_samples): 
                update_progress(step / int(x_test.shape[0] / (batch_size)))
+
                adv_x = x + adv_perturbations[test_no_steps, :, :, :]
                adv_x = tf.clip_by_value(adv_x, 0.0, 1.0)              
 
@@ -975,13 +1021,21 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
         pf.close()
         
         
-        var = np.zeros([int(test_samples) ,batch_size])      
+        var = np.zeros([int(test_samples) ,batch_size])    
         for i in range(int(test_samples)):
             for j in range(batch_size):               
                 predicted_out = np.argmax(mu_out_[i,j,:])
-                var[i,j] = sigma_[i,j, int(predicted_out), int(predicted_out)]               
+                var[i,j] = sigma_[i,j, int(predicted_out), int(predicted_out)]             
          
-        print('Output Variance', np.mean(var))       
+        print('Output Variance', np.mean(var))   
+        
+##        var1 = np.reshape(var, int(test_samples)* batch_size)  
+##        #print(var1)              
+##        writer = pd.ExcelWriter(PATH + test_path + 'variance.xlsx', engine='xlsxwriter')
+##        df = pd.DataFrame(np.abs(var1) )   
+##        # Write your DataFrame to a file   
+##        df.to_excel(writer, "Sheet")            
+##        writer.save()
 
         textfile = open(PATH + test_path + 'Related_hyperparameters.txt', 'w')
         textfile.write(' Input Dimension : ' + str(input_dim))
@@ -1006,16 +1060,19 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
             else:
                 textfile.write('\n Adversarial attack: Non-TARGETED')
             textfile.write('\n Adversarial Noise epsilon: ' + str(epsilon))
-            textfile.write('\n Adversarial Noise HCV: ' + str(HCV))        
+            textfile.write('\n Adversarial Noise HCV: ' + str(HCV))
+         #   textfile.write("\n SNR: "+ str(np.mean(snr_signal))) 
         textfile.write("\n---------------------------------")
-        textfile.close()       
-            
-            
-    if (PGD_Adversarial_noise):
+        textfile.close()
+        
+        
+        
+                
+    elif (PGD_Adversarial_noise):
         if Targeted:
             test_path = 'test_results_targeted_PGDadversarial_noise_{}_max_iter_{}_{}/'.format(HCV, maxAdvStep, stepSize)
         else:
-            test_path = 'test_results_non_targeted_PGDadversarial_noise_{}_max_iter_{}_{}/'.format(HCV, maxAdvStep, stepSize)
+            test_path = 'test_results_non_targeted_PGDadversarial_noise_{}/'.format(HCV)
         cnn_model.load_weights(PATH + 'vdp_cnn_model')
         cnn_model.trainable = False         
 
@@ -1042,36 +1099,40 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
                 else:
                     adv_perturbations[test_no_steps, :, :, :] = create_adversarial_pattern(adv_x, y)
                 adv_x = adv_x + stepSize * adv_perturbations[test_no_steps, :, :, :]
-                adv_x = tf.clip_by_value(adv_x, x - epsilon, x + epsilon)
-                adv_x = tf.clip_by_value(adv_x, 0.0, 1.0)                          
+                pgdTotalNoise = tf.clip_by_value(adv_x - x, -epsilon, epsilon)
+                adv_x = tf.clip_by_value(x + pgdTotalNoise, 0.0, 1.0)          
             
             mu_out, sigma   = test_on_batch(adv_x, y)            
-            mu_out_[test_no_steps,  :, :] = mu_out
+            mu_out_[test_no_steps, :, :] = mu_out
             sigma_[test_no_steps, :, :, :] = sigma
             corr = tf.equal(tf.math.argmax(mu_out, axis=-1), tf.math.argmax(y, axis=-1))
             accuracy = tf.reduce_mean(tf.cast(corr, tf.float32))
             acc_test[test_no_steps]=accuracy.numpy()            
             if step % 50 == 0:
-                print("Total running accuracy so far: %.4f" % acc_test[test_no_steps] )
+                print("Total running accuracy so far: %.4f" % acc_test[test_no_steps])
             test_no_steps += 1
         test_acc = np.mean(acc_test)            
         print('Test accuracy : ', test_acc)
         print('Best Test accuracy : ', np.amax(acc_test) )
 
         pf = open(PATH + test_path + 'uncertainty_info.pkl', 'wb')
-        pickle.dump([mu_out_, sigma_, true_x, true_y, test_acc], pf)
+        pickle.dump([mu_out_, sigma_, true_x, true_y, adv_perturbations, test_acc], pf)
         pf.close()
         
         
-        var = np.zeros([int(x_test.shape[0] /batch_size) ,batch_size])        
+        var = np.zeros([int(x_test.shape[0] /batch_size) ,batch_size])
+        snr_signal = np.zeros([int(x_test.shape[0] /batch_size) ,batch_size])
         for i in range(int(x_test.shape[0] /batch_size)):
             for j in range(batch_size):               
                 predicted_out = np.argmax(mu_out_[i,j,:])
-                var[i,j] = sigma_[i,j, int(predicted_out), int(predicted_out)]              
+                var[i,j] = sigma_[i,j, int(predicted_out), int(predicted_out)]
+                snr_signal[i,j] = 10*np.log10( np.sum(np.square(true_x[i,j,:, :,:]))/np.sum( np.square(epsilon*adv_perturbations[i, j, :, :, :]  ) ))
          
-        print('Output Variance', np.mean(var))     
+        print('Output Variance', np.mean(var))
+        print('SNR', np.mean(snr_signal)) 
         
-##        var1 = np.reshape(var, int(x_test.shape[0]/(batch_size))* batch_size)                  
+##        var1 = np.reshape(var, int(x_test.shape[0]/(batch_size))* batch_size)  
+##        #print(var1)              
 ##        writer = pd.ExcelWriter(PATH + test_path + 'variance.xlsx', engine='xlsxwriter')
 ##        df = pd.DataFrame(np.abs(var1) )   
 ##        # Write your DataFrame to a file   
@@ -1102,13 +1163,10 @@ def main_function(input_dim=32, n_channel=3, num_kernels=[32, 32, 32, 32, 64, 64
                 textfile.write('\n Adversarial attack: Non-TARGETED')
             textfile.write('\n Adversarial Noise epsilon: ' + str(epsilon))
             textfile.write('\n Adversarial Noise HCV: ' + str(HCV))
-          #  textfile.write("\n SNR: "+ str(np.mean(snr_signal))) 
+            textfile.write("\n SNR: "+ str(np.mean(snr_signal))) 
             textfile.write("\n stepSize: "+ str(stepSize)) 
             textfile.write("\n Maximum number of iterations: "+ str(maxAdvStep))
         textfile.write("\n---------------------------------")
-        textfile.close()    
-        
-
-
+        textfile.close()  
 if __name__ == '__main__':
     main_function()
