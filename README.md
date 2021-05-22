@@ -8,3 +8,9 @@ We introduce a tensor normal distribution as a prior over convolutional kernels 
 We start by deriving the first-order mean-covariance propagation framework. Later, we develop a framework based on the unscented transformation (correct at least up to the second-order) that propagates \textit{sigma points} of the variational distribution through layers of a CNN. The propagated covariance of the predictive distribution captures uncertainty in the output decision. Comprehensive experiments conducted on diverse benchmark datasets demonstrate: 1) superior robustness against noise and adversarial attacks, 2) self-assessment through predictive uncertainty that increases quickly with increasing levels of noise or attacks, and 3) an ability to detect a targeted attack from ambient noise.
 
 
+Citation:
+
+If this is useful for your work, please cite our paper:
+
+Dimah Dera, Nidhal C. Bouaynaya, Ghulam Rasool, Roman Shterenberg and Hassan M Fathallah Shaykh, “PremiUm-CNN: Propagating Uncertainty towards Robust Convolutional Neural 
+Networks,” IEEE Transactions on Signal Processing, 2021 (under review). 
